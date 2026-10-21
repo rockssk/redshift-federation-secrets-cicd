@@ -2,6 +2,8 @@
 
 Start with [`ONE_PAGER.md`](ONE_PAGER.md) for the why and the design. This README covers setup.
 
+> This is a template, so GitHub Actions is disabled on this repo. Copy it into your own repo and finish the one-time setup below; the workflow runs once Actions is enabled.
+
 ```
 .github/workflows/redshift-federation.yml   PR plan → approved apply → rotate / destroy
 infra/01-secret-scope/                      Terraform: secret scope + ACLs (no values)
