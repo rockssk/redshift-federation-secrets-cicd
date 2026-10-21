@@ -1,0 +1,171 @@
+# Redshift → Unity Catalog federation, fully through Git.
+#
+#   PR to main          → fmt / validate / plan for both stacks, plan posted on the PR
+#   merge to main       → apply (gated by the "prod" GitHub environment approval)
+#   manual "rotate"     → re-sync secrets from AWS Secrets Manager + ALTER CONNECTION
+#   manual "destroy"    → remove catalog, connection and scope
+#
+# No credentials are stored in GitHub. Databricks and AWS are both reached with
+# short-lived GitHub OIDC tokens; the Redshift password lives only in AWS
+# Secrets Manager and the Databricks secret scope.
+name: redshift-federation
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["infra/**", "scripts/**", ".github/workflows/redshift-federation.yml"]
+  push:
+    branches: [main]
+    paths: ["infra/**", "scripts/**", ".github/workflows/redshift-federation.yml"]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to run"
+        type: choice
+        options: [deploy, rotate, destroy]
+        default: deploy
+
+permissions:
+  id-token: write        # GitHub OIDC → Databricks and AWS
+  contents: read
+  pull-requests: write   # post the plan on the PR
+
+concurrency:
+  group: redshift-federation-prod
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VARS: ../envs/prod.tfvars
+  # Databricks auth: workload identity federation for the CI service principal
+  DATABRICKS_AUTH_TYPE: github-oidc
+  DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+  WAREHOUSE_ID: ${{ vars.WAREHOUSE_ID }}
+  SECRET_SCOPE: redshift-fed-scope
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      # Read-only SP for PR plans; its federation policy trusts the pull_request subject
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_PLAN_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "1.9.8", terraform_wrapper: false }
+      - uses: databricks/setup-cli@main
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}   # TF state read + DescribeSecret only, no GetSecretValue
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive infra
+      - name: Current secret version (metadata only)
+        id: ver
+        run: |
+          V=$(aws secretsmanager describe-secret --secret-id "${{ vars.AWS_REDSHIFT_SECRET_ID }}" \
+            --query 'VersionIdsToStages' --output json | jq -r 'to_entries[] | select(.value | index("AWSCURRENT")) | .key')
+          echo "secret_version=$V" >> "$GITHUB_OUTPUT"
+      - name: Plan
+        run: |
+          for stack in 01-secret-scope 02-federation; do
+            pushd "infra/$stack" >/dev/null
+            terraform init -input=false \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+              -backend-config="key=redshift-federation/$stack.tfstate" \
+              -backend-config="region=${{ vars.AWS_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+              -backend-config="encrypt=true"
+            terraform validate
+            # Plans contain only scope/key NAMES, never credential values, so they are safe to post.
+            EXTRA=()
+            [[ "$stack" == 02-federation ]] && EXTRA=(-var="warehouse_id=$WAREHOUSE_ID" -var="secret_version=${{ steps.ver.outputs.secret_version }}")
+            terraform plan -input=false -no-color -lock=false -var-file="$TF_VARS" "${EXTRA[@]}" > plan.txt 2>&1 || { cat plan.txt; exit 1; }
+            { echo "### $stack"; echo '```'; tail -n 60 plan.txt; echo '```'; } >> "$GITHUB_WORKSPACE/plan.md"
+            popd >/dev/null
+          done
+      - name: Comment plan on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with: { path: plan.md }
+
+  apply:
+    if: >
+      (github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && inputs.action != 'destroy')
+    runs-on: ubuntu-latest
+    environment: prod               # required reviewers configured on this environment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "1.9.8", terraform_wrapper: false }
+      - uses: databricks/setup-cli@main
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}   # can read the Redshift secret + TF state
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        run: |
+          for stack in 01-secret-scope 02-federation; do
+            terraform -chdir="infra/$stack" init -input=false \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+              -backend-config="key=redshift-federation/$stack.tfstate" \
+              -backend-config="region=${{ vars.AWS_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+              -backend-config="encrypt=true"
+          done
+
+      # 1. Terraform: secret scope (no values)
+      - name: Apply 01-secret-scope
+        if: inputs.action != 'rotate'
+        run: terraform -chdir=infra/01-secret-scope apply -input=false -auto-approve -var-file="$TF_VARS"
+
+      # 2. API: secret values, AWS Secrets Manager → Databricks secret scope
+      - name: Sync secrets
+        id: sync
+        run: |
+          VERSION=$(scripts/sync_secrets.sh "${{ vars.AWS_REDSHIFT_SECRET_ID }}" "$SECRET_SCOPE")
+          echo "secret_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # 3. Terraform (+ SQL API): connection with secret(), foreign catalog, grants
+      - name: Apply 02-federation
+        run: |
+          terraform -chdir=infra/02-federation apply -input=false -auto-approve \
+            -var-file="$TF_VARS" \
+            -var="warehouse_id=$WAREHOUSE_ID" \
+            -var="secret_version=${{ steps.sync.outputs.secret_version }}"
+
+      # 4. Smoke test: authenticates to Redshift through the connection
+      - name: Smoke test
+        run: |
+          CATALOG=$(terraform -chdir=infra/02-federation output -raw catalog_name)
+          scripts/run_sql.sh "SHOW SCHEMAS IN \`$CATALOG\`"
+
+  destroy:
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "1.9.8", terraform_wrapper: false }
+      - uses: databricks/setup-cli@main
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Destroy (catalog + connection first, then scope)
+        run: |
+          for stack in 02-federation 01-secret-scope; do
+            terraform -chdir="infra/$stack" init -input=false \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+              -backend-config="key=redshift-federation/$stack.tfstate" \
+              -backend-config="region=${{ vars.AWS_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+              -backend-config="encrypt=true"
+            EXTRA=()
+            [[ "$stack" == 02-federation ]] && EXTRA=(-var="warehouse_id=$WAREHOUSE_ID")
+            terraform -chdir="infra/$stack" destroy -input=false -auto-approve -var-file="$TF_VARS" "${EXTRA[@]}"
+          done
