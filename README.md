@@ -68,3 +68,14 @@ SHOW SCHEMAS IN redshift_fed;              -- authenticates to Redshift
 SELECT * FROM redshift_fed.<schema>.<table> LIMIT 10;
 ```
 To confirm nothing leaked: `aws s3 cp s3://$TF_STATE_BUCKET/redshift-federation/02-federation.tfstate - | grep -c '<password>'` should print `0`.
+
+## Tested
+The connection pattern (`terraform_data` → SQL Statement Execution API → `CREATE CONNECTION ... secret('scope','key')`) was run end to end on a Databricks AWS workspace (Unity Catalog, serverless SQL warehouse, October 2026). A public read-only PostgreSQL database stood in for Redshift; the Redshift version differs only in `TYPE REDSHIFT` and port `5439`.
+
+- `terraform apply` created the connection with the SQL DDL, then the foreign catalog and grants.
+- The connection's metadata (`databricks connections get`) shows only `host` and `port`, with `credential_type = USERNAME_PASSWORD`. The username and password are not shown.
+- `SHOW SCHEMAS` and `SELECT` on the foreign catalog succeed, so the credentials from the secret scope authenticate.
+- The password appears 0 times in the Terraform state file.
+- If the deploying identity lacks the privilege, the statement fails with `PERMISSION_DENIED: ... does not have CREATE CONNECTION on Metastore`, and Terraform reports a `local-exec` error rather than a silent success.
+
+Not yet tested: whether a rotated secret value takes effect without re-running `ALTER CONNECTION`. Until that is confirmed, keep the **rotate** step, which re-runs it.
