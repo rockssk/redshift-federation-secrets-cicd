@@ -1,0 +1,38 @@
+# Databricks side of the automation (separate stack, Databricks provider).
+# Rename to databricks.tf in the stack that owns your workspace objects.
+# Grants the automation service principal exactly what the Lambda needs.
+
+resource "databricks_service_principal" "secret_sync" {
+  display_name = "secret-sync-automation"
+}
+
+# Write values into the scope (READ is not needed; WRITE covers put-secret).
+resource "databricks_secret_acl" "secret_sync" {
+  scope      = "redshift-fed-scope"
+  principal  = databricks_service_principal.secret_sync.application_id
+  permission = "WRITE"
+}
+
+# Run ALTER CONNECTION and the validation query.
+resource "databricks_permissions" "warehouse" {
+  sql_endpoint_id = "<warehouse-id>"
+  access_control {
+    service_principal_name = databricks_service_principal.secret_sync.application_id
+    permission_level       = "CAN_USE"
+  }
+}
+
+# ALTER CONNECTION ... OPTIONS needs ownership of the connection (or MANAGE).
+# Option A: make the SP the owner (run once):
+#   ALTER CONNECTION redshift_fed SET OWNER TO `<sp-application-id>`;
+# Option B: grant MANAGE on the connection to the SP.
+#
+# secret() in the DDL is resolved with the identity that runs it, so the SP must
+# be able to read the scope. A WRITE ACL on a secret scope includes READ.
+
+# The SP's OAuth secret is created out-of-band and piped straight into AWS
+# Secrets Manager, so it never lands in Terraform state:
+#   databricks api post /api/2.0/accounts/servicePrincipals/<sp-numeric-id>/credentials/secrets \
+#     --profile <ws> | jq -c '{client_id: "<sp-application-id>", client_secret: .secret}' \
+#     | aws secretsmanager put-secret-value --secret-id databricks/secret-sync-sp --secret-string file:///dev/stdin
+# Rotate it before its expire_time (the same command, then delete the old secret id).

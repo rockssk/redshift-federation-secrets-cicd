@@ -65,7 +65,8 @@ manual: destroy ─────▶ 02-federation (catalog, connection) ▶ 01-se
 
 ## Notes
 - **Rotation:** a new AWS secret version is picked up on the next pipeline run, which re-applies `ALTER CONNECTION ... secret()`.
-  Use the manual **rotate** run for an immediate cut-over.
+  Use the manual **rotate** run for an immediate cut-over, or deploy [`rotation/`](rotation/README.md) to sync and re-alter automatically on every AWS rotation.
+  Updating the scope alone is not enough: the connection keeps the value it copied at `CREATE`/`ALTER` (verified).
 - **Moving off the workaround:** when #4327 ships, replace `terraform_data` with `databricks_connection` and use `terraform import`.
   The scope, catalog and grants stay as they are.
 - **Sample repo:** `cicd-sample/` contains `infra/01-secret-scope`, `infra/02-federation`, `scripts/`, and `.github/workflows/redshift-federation.yml`.

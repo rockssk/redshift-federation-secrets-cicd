@@ -11,6 +11,7 @@ infra/02-federation/                        Terraform: connection (terraform_dat
 infra/envs/prod.tfvars                      Non-sensitive config only
 scripts/sync_secrets.sh                     AWS Secrets Manager → Databricks scope (masked, via stdin)
 scripts/run_sql.sh                          One statement via the SQL Statement Execution API
+rotation/                                   Optional: event-driven rotation (Secrets Manager → EventBridge → Lambda → scope + ALTER CONNECTION)
 ```
 
 ## One-time setup
@@ -56,7 +57,7 @@ scripts/run_sql.sh                          One statement via the SQL Statement 
 | Task | How |
 |---|---|
 | Change host, port, scope or keys | Edit `prod.tfvars` in a PR. The merge runs `ALTER CONNECTION` in place, and the catalog isn't touched. |
-| Rotate the password | Rotate it in AWS Secrets Manager, then run the workflow manually with **rotate**, or wait for the next merge. |
+| Rotate the password | Rotate it in AWS Secrets Manager, then run the workflow manually with **rotate**, or wait for the next merge. To automate this, deploy [`rotation/`](rotation/README.md). |
 | Add readers | Add the group to `reader_groups` in a PR. |
 | Rename the connection or change its type | Edit `prod.tfvars` in a PR. Terraform drops and recreates the connection and the catalog. |
 | Tear down | Run the workflow manually with **destroy** (needs the `prod` approval). |
@@ -78,4 +79,4 @@ The connection pattern (`terraform_data` → SQL Statement Execution API → `CR
 - The password appears 0 times in the Terraform state file.
 - If the deploying identity lacks the privilege, the statement fails with `PERMISSION_DENIED: ... does not have CREATE CONNECTION on Metastore`, and Terraform reports a `local-exec` error rather than a silent success.
 
-Not yet tested: whether a rotated secret value takes effect without re-running `ALTER CONNECTION`. Until that is confirmed, keep the **rotate** step, which re-runs it.
+Rotation (tested November 2026, see [`rotation/README.md`](rotation/README.md)): a connection **copies the secret value when it is created or altered**. Updating only the secret scope does not change an existing connection, so every rotation must re-run `ALTER CONNECTION`. The workflow's **rotate** step does this. [`rotation/`](rotation/README.md) does it automatically when the secret rotates in AWS.
